@@ -3728,11 +3728,13 @@ addEventListener('resize',resize);
 
 /* ---- fluidez: contador (?fps=1) e qualidade automática ----
    Mede o tempo real entre quadros. Quadro médio > 25 ms por 2 s seguidos = desce 1 degrau; <= 19,5 ms por 12 s = tenta subir de volta
-   (se descer logo em seguida, a espera dobra: sem gangorra). Só mexe no desenho (resolução, névoa e partículas, sombra do 3D), nunca na
+   (se descer logo em seguida, a espera dobra: sem gangorra). Toda descida é conferida 2 s depois: se o quadro não melhorou 8%, o aparelho
+   está preso por outra coisa (ex.: Modo de Pouca Energia do iPhone, 30 fps) e a descida é desfeita (nova tentativa só daqui a 2 min).
+   Só mexe no desenho (resolução, névoa e partículas, sombra do 3D), nunca na
    simulação. Degrau que não muda nada neste aparelho é pulado. O degrau fica guardado no aparelho (eras-qual).
    Q0 cheio · Q1 resolução até 1,5 · Q2 + sem névoa e partículas (2D) · Q3 resolução 1 · Q4 + sem sombra (3D).
    Em ?test=1 fica desligado (teste determinístico), salvo com &qa=1. */
-const QUAL={t:0,soma:0,nq:0,dec:0,pior:0,ruim:0,bom:0,espera:12,seg:0,subiuSeg:-999,fps:0,ms:0,sim:false};
+const QUAL={t:0,soma:0,nq:0,dec:0,pior:0,ruim:0,bom:0,espera:12,seg:0,subiuSeg:-999,carencia:0,prova:null,semGanhoAte:0,piso:0,fps:0,ms:0,sim:false};
 const QUAL_LIM=4,QUAL_KEY='eras-qual',FPS_VIS=/[?&]fps=1(&|$)/.test(location.search);
 const QUAL_AUTO=!/[?&]test=1(&|$)/.test(location.search)||/[?&]qa=1(&|$)/.test(location.search);
 function dbgEl(){
@@ -3740,7 +3742,7 @@ function dbgEl(){
   if(!d){d=D.createElement('div');d.id='dbg3';d.style.cssText='position:absolute;left:50%;bottom:3px;transform:translateX(-50%);z-index:60;font:11px monospace;color:#9f9;background:rgba(0,0,0,.65);padding:2px 6px;border-radius:3px;pointer-events:none;white-space:nowrap';d.textContent='...';$('#app').appendChild(d);}
   return d;
 }
-function qualSig(t){ // o que o degrau t muda de fato neste aparelho
+function qualSig(t){ // o que o degrau t muda de fato neste aparelho (no 3D: resolução do 3D e sombra; o canvas de HUD por cima fica de fora de propósito)
   const cap=t>=3?1:t>=1?1.5:2,pr=Math.min(cap,window.devicePixelRatio||1);
   return mode3d&&R3?Math.min(ISO.pr,pr)+'|'+(t>=4?'s':'-'):pr+'|'+(t>=2?'f':'-');
 }
@@ -3750,14 +3752,19 @@ function qualAplica(){
   if(R3)R3.sun.castShadow=t<4;
   if(dprCap!==antes)resize();
 }
-function qualMuda(d){ // d=+1 desce a qualidade, d=-1 sobe; pula degrau que não muda nada
+function qualGrava(){try{localStorage.setItem(QUAL_KEY,String(QUAL.t));}catch(e){}}
+function qualPara2d(){ // 3D no último degrau e ainda travando: esta sessão segue em 2D (a escolha guardada do menu não muda)
+  gfxPref='2d';applyGfx();QUAL.t=3;QUAL.piso=0;QUAL.carencia=2;qualAplica();
+}
+function qualVolta(t){QUAL.t=t;qualAplica();QUAL.carencia=1;}
+function qualMuda(d,ms){ // d=+1 desce a qualidade, d=-1 sobe; pula degrau que não muda nada; devolve o degrau anterior ou -1. ms = quadro médio de agora (prova da descida)
   const s0=qualSig(QUAL.t);let t=QUAL.t+d;
   while(t>=0&&t<=QUAL_LIM&&qualSig(t)===s0)t+=d;
-  if(t<0||t>QUAL_LIM)return false;
+  if(t<0||t>QUAL_LIM)return -1;
   if(d<0){const s1=qualSig(t);while(t>0&&qualSig(t-1)===s1)t--;}
-  QUAL.t=t;qualAplica();
-  try{localStorage.setItem(QUAL_KEY,String(t));}catch(e){}
-  return true;
+  const antes=QUAL.t;QUAL.t=t;qualAplica();QUAL.carencia=1; // o quadro logo depois da troca (resize, shaders) não conta
+  if(d<0)qualGrava();else QUAL.prova={t:antes,ms:ms,n:1}; // descida só é gravada depois de provar que ajudou
+  return antes;
 }
 function qualTxt(){return' · Q'+QUAL.t+(QUAL_AUTO?'':' fixo')+' · res '+(R3&&mode3d?R3.ren.getPixelRatio():S.view.dpr)+'x';}
 function qualAlimenta(ms){ // 1 quadro de jogo rodando, em ms reais (cada quadro conta no máximo 250 ms: aba parada não vira "lento")
@@ -3768,21 +3775,29 @@ function qualAlimenta(ms){ // 1 quadro de jogo rodando, em ms reais (cada quadro
   Q.ms=med;Q.fps=med?1000/med:0;Q.soma=Q.nq=Q.dec=Q.pior=0;Q.seg++;
   if(FPS_VIS&&!(R3&&mode3d))dbgEl().textContent=Q.fps.toFixed(0)+' fps · pior '+pior.toFixed(0)+' ms'+qualTxt()+' · inim '+S.en.length;
   if(!QUAL_AUTO)return;
-  if(med>25){Q.ruim+=med>50?2:1;Q.bom=0;}
-  else if(med<=19.5){Q.bom++;Q.ruim=0;if(Q.espera>12&&Q.seg-Q.subiuSeg>60)Q.espera=12;}
+  if(Q.carencia>0){Q.carencia--;return;}
+  if(Q.prova){ // 2 s depois de descer: ajudou?
+    if(--Q.prova.n>0)return;
+    const p=Q.prova;Q.prova=null;
+    if(med>p.ms*.92){qualVolta(p.t);Q.semGanhoAte=Q.seg+120;Q.ruim=Q.bom=0;return;}
+    qualGrava();
+  }
+  if(mode3d&&R3&&Q.t>=QUAL_LIM&&med>40){if(++Q.piso>=6){qualPara2d();return;}}else Q.piso=0;
+  if(med>25){Q.ruim=Math.min(4,Q.ruim+(med>50?2:1));Q.bom=0;}
+  else if(med<=19.5){Q.bom++;Q.ruim=0;if(Q.espera>12&&Q.subiuSeg>0&&Q.seg-Q.subiuSeg>60)Q.espera=12;} // espera só volta a 12 se a subida se sustentou por 60 s
   else{Q.bom=0;if(Q.ruim>0)Q.ruim--;}
-  if(Q.ruim>=2){
+  if(Q.ruim>=2&&Q.seg>=Q.semGanhoAte){
     Q.ruim=Q.bom=0;
-    if(qualMuda(1)&&Q.seg-Q.subiuSeg<=25)Q.espera=Math.min(96,Q.espera*2);
+    if(qualMuda(1,med)>=0&&Q.subiuSeg>0&&Q.seg-Q.subiuSeg<=25){Q.espera=Math.min(96,Q.espera*2);Q.subiuSeg=-999;} // desceu logo depois de subir: dobra 1 vez por subida
   }else if(Q.bom>=Q.espera){
     Q.bom=0;
-    if(qualMuda(-1))Q.subiuSeg=Q.seg;
+    if(qualMuda(-1)>=0)Q.subiuSeg=Q.seg;
   }
 }
 function qualQuadro(ms){
   if(QUAL.sim)return;
   if(S.mode==='play'&&!S.paused&&!D.hidden)qualAlimenta(ms);
-  else{QUAL.dec=QUAL.soma=QUAL.nq=QUAL.pior=0;}
+  else{QUAL.dec=QUAL.soma=QUAL.nq=QUAL.pior=0;QUAL.ruim=QUAL.bom=0;QUAL.carencia=2;} // fora da partida nada acumula; ao voltar, as 2 primeiras janelas (carga do ato, shaders) não contam
 }
 function qualInicia(){
   if(QUAL_AUTO){try{const v=+localStorage.getItem(QUAL_KEY);if(v>=1&&v<=QUAL_LIM)QUAL.t=v|0;}catch(e){}}
@@ -4723,7 +4738,7 @@ function drawMini(){
 
 /* =================== 3D (Three.js, global THREE r128) =================== */
 let mode3d=false,gfxPref='3d';
-try{gfxPref=localStorage.getItem('eras-gfx')||'2d';}catch(e){}
+try{gfxPref=localStorage.getItem('eras-gfx')||(TESTE||PACOTE_LIBERADO?'3d':'2d');}catch(e){} // 3D é o padrão no build de teste e quando o pacote for liberado; quem já escolheu no menu mantém a escolha
 const GEO={},MATC={};
 function geos(){
   if(GEO.box)return;
